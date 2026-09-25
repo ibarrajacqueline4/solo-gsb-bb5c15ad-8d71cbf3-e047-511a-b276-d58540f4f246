@@ -8,6 +8,7 @@ const {
   findGenerationConflicts,
   validateEdge,
   previewEdgeImpact,
+  previewMemberDeletion,
   descendantBranches,
   MAX_DESCENDANT_GENERATIONS,
 } = require('./familyGraph');
@@ -180,6 +181,53 @@ app.post('/api/edges/impact/preview', (req, res) => {
     added: result.added.map(decorateItem),
     removed: result.removed.map(decorateItem),
     changed: result.changed.map(decorateItem),
+  });
+});
+
+/**
+ * 删除成员影响预览（只读，不写入任何数据）：
+ * 以当前家谱为基准构造不落盘的只读假设图——移除该成员及其相连的全部亲子关系，
+ * 只比较删除后仍在谱中的有序「祖先 → 后代」成员对（以删除前原本可达为准），
+ * 按最短代数逐对判定：原本可达而删除后不可达的列入 disconnected（删除后链为空），
+ * 仍可达但最短代数增加的列入 lengthened（仍有同代替代路径的不报断联），
+ * 每条给出变更前后各一条最短成员链。响应携带当前家谱版本 version：
+ * 页面据此标注「基于版本 N」，家谱发生写入后结果标记过期、需重新预览。
+ * 请求体：{ memberId }
+ */
+app.post('/api/members/delete-impact/preview', (req, res) => {
+  const memberId = requireId(req.body, 'memberId');
+  if (!memberId) return sendError(res, 400, '请选择要预览删除的成员');
+
+  const result = previewMemberDeletion(store.getState(), memberId);
+  if (result.error) return sendError(res, 400, result.error);
+
+  const byId = new Map(store.list().members.map((m) => [m.id, m.name]));
+  const nameOf = (id) => byId.get(id) || '（已删除）';
+  const decorateChain = (path) => path.map((id) => ({ id, name: nameOf(id) }));
+  const decorateProfile = (p) =>
+    p && { minGen: p.minGen, shortestPath: decorateChain(p.shortestPath) };
+  const decorateItem = (item) => ({
+    ancestorId: item.ancestorId,
+    ancestorName: nameOf(item.ancestorId),
+    descendantId: item.descendantId,
+    descendantName: nameOf(item.descendantId),
+    ...(item.genIncrease !== undefined ? { genIncrease: item.genIncrease } : {}),
+    before: decorateProfile(item.before),
+    after: decorateProfile(item.after),
+  });
+
+  res.json({
+    version: store.getVersion(),
+    memberId: result.memberId,
+    memberName: nameOf(result.memberId),
+    removedEdgeCount: result.removedEdgeCount,
+    remainingMemberCount: result.remainingMemberCount,
+    comparedCount: result.comparedCount,
+    disconnectedCount: result.disconnectedCount,
+    lengthenedCount: result.lengthenedCount,
+    unaffectedCount: result.unaffectedCount,
+    disconnected: result.disconnected.map(decorateItem),
+    lengthened: result.lengthened.map(decorateItem),
   });
 });
 

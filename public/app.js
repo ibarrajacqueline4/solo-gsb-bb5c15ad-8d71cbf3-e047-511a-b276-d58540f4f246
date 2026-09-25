@@ -47,6 +47,12 @@ let impactPreview = null;
 let impactStale = false;
 let impactStaleReason = '';
 
+// 最近一次「删除成员影响预览」：{ version, memberId, disconnected, lengthened, ...服务端返回 }
+// 结果保持展示；家谱发生写入（版本变化）后标记为过期并提示重新预览；目标成员被删除后清空
+let memberImpactPreview = null;
+let memberImpactStale = false;
+let memberImpactStaleReason = '';
+
 // 最近一次恢复预览：{ version, fingerprint, content, valid, errors, memberCount, edgeCount, memberNames }
 // 仅当 version 与当前家谱版本一致且所选文件未变化时有效；确认时原样带回指纹与版本
 let restorePreview = null;
@@ -124,6 +130,7 @@ async function refresh() {
   if (versionChanged && impactPreview && !impactStale) {
     invalidateImpactPreview('家谱已发生写入，以下预览基于旧版本，请重新预览');
   }
+  invalidateMemberImpactOnRefresh(versionChanged);
   if (versionChanged && restorePreview && !restoreStale) {
     invalidateRestorePreview('家谱已发生写入，以下恢复预览基于旧版本，请重新预览');
   }
@@ -147,6 +154,7 @@ function applyStateAndRender(data) {
   if (versionChanged && impactPreview && !impactStale) {
     invalidateImpactPreview('家谱已发生写入，以下预览基于旧版本，请重新预览');
   }
+  invalidateMemberImpactOnRefresh(versionChanged);
   if (versionChanged && restorePreview && !restoreStale) {
     invalidateRestorePreview('家谱已发生写入，以下恢复预览基于旧版本，请重新预览');
   }
@@ -155,6 +163,25 @@ function applyStateAndRender(data) {
   }
   render();
   loadUpcoming();
+}
+
+/**
+ * 家谱刷新后处理「删除影响预览」：
+ * 被预览的成员已不在谱中（可能已被删除或被合并）→ 预览直接清空并回到占位提示；
+ * 其余任何写入（版本推进）→ 保留展示但标记过期，提示重新预览。
+ */
+function invalidateMemberImpactOnRefresh(versionChanged) {
+  if (!memberImpactPreview) return;
+  if (!state.members.some((m) => m.id === memberImpactPreview.memberId)) {
+    memberImpactPreview = null;
+    memberImpactStale = false;
+    memberImpactStaleReason = '';
+    renderMemberImpactPlaceholder();
+    return;
+  }
+  if (versionChanged && !memberImpactStale) {
+    invalidateMemberImpactPreview('家谱已发生写入，以下删除影响预览基于旧版本，请重新预览');
+  }
 }
 
 function reconcileSelection() {
@@ -278,6 +305,11 @@ function renderMembers() {
       class: 'danger-link',
       text: '重命名',
       onClick: () => startRename(li, m),
+    }));
+    li.appendChild(el('button', {
+      class: 'link-action',
+      text: '删除影响',
+      onClick: () => previewMemberDeletionImpact(m),
     }));
     li.appendChild(el('button', {
       class: 'danger-link',
@@ -406,6 +438,11 @@ function renderStaleBanner() {
     $('impact-result'),
     impactStale,
     `⚠️ ${impactStaleReason || '家谱在上次预览后发生过写入，以下结果可能已过期，请重新预览。'}`,
+  );
+  renderOneStaleBanner(
+    $('member-impact-result'),
+    memberImpactStale,
+    `⚠️ ${memberImpactStaleReason || '家谱在上次预览后发生过写入，以下结果可能已过期，请重新预览。'}`,
   );
   renderOneStaleBanner(
     $('branch-result'),
@@ -1285,6 +1322,143 @@ function renderImpactResult(data) {
   if (data.added.length > 0) box.appendChild(renderImpactGroup('新增的矛盾', data.added));
   if (data.removed.length > 0) box.appendChild(renderImpactGroup('消失的矛盾', data.removed));
   if (data.changed.length > 0) box.appendChild(renderImpactGroup('代数范围变化的矛盾', data.changed));
+}
+
+/* ---------------- 删除成员影响预览 ---------------- */
+
+function invalidateMemberImpactPreview(reason) {
+  memberImpactStale = true;
+  memberImpactStaleReason = reason;
+  renderStaleBanner();
+}
+
+function renderMemberImpactPlaceholder() {
+  const box = $('member-impact-result');
+  box.replaceChildren();
+  delete box.dataset.hasResult;
+  box.appendChild(el('p', {
+    class: 'placeholder',
+    text: '在「① 成员」中点击某位成员的「删除影响」查看预览。',
+  }));
+}
+
+/** 删除影响预览：在不落盘的只读假设图上移除该成员及其亲子关系，逐对对比最短可达性 */
+async function previewMemberDeletionImpact(member) {
+  try {
+    const data = await api('/api/members/delete-impact/preview', {
+      method: 'POST',
+      body: JSON.stringify({ memberId: member.id }),
+    });
+    // 请求往返期间该成员可能已被其他操作删除
+    if (!state.members.some((m) => m.id === member.id)) {
+      renderMemberImpactPlaceholder();
+      toast('该成员已不在当前家谱中', true);
+      return;
+    }
+    memberImpactPreview = data;
+    memberImpactStale = false;
+    memberImpactStaleReason = '';
+    renderMemberImpactResult(data);
+    $('member-impact-result').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+/** 渲染删除前后各一侧的最短成员链（after 为 null 时为空，即不可达） */
+function renderDeletionSide(label, profile) {
+  const col = el('div', { class: 'path-col' });
+  col.appendChild(el('h4', { text: label }));
+  if (!profile) {
+    col.appendChild(el('p', { class: 'empty-hint', text: '不可达（无成员链）。' }));
+    return col;
+  }
+  col.appendChild(renderGenChainLine(profile.shortestPath, `${profile.minGen} 代`));
+  return col;
+}
+
+function renderDeletionItem(item, kind) {
+  const block = el('div', { class: 'conflict-block ancestor-block' });
+  block.appendChild(el('h3', {}, [
+    document.createTextNode('「'),
+    el('strong', { text: item.ancestorName }),
+    document.createTextNode('」 → … → 「'),
+    el('strong', { text: item.descendantName }),
+    document.createTextNode('」'),
+  ]));
+  if (kind === 'lengthened') {
+    block.appendChild(el('p', { class: 'ancestor-meta' }, [
+      document.createTextNode('删除后仍可达，但最短代数 '),
+      el('strong', { text: `${item.before.minGen} 代 → ${item.after.minGen} 代` }),
+      document.createTextNode('（'),
+      el('strong', { class: 'conflict-diff', text: `增加 ${item.genIncrease} 代` }),
+      document.createTextNode('）：最短链必须绕开被删成员改走替代路径。'),
+    ]));
+  } else {
+    block.appendChild(el('p', { class: 'ancestor-meta' }, [
+      document.createTextNode('删除前最短 '),
+      el('strong', { text: `${item.before.minGen} 代` }),
+      document.createTextNode(' 可达；删除后'),
+      el('strong', { class: 'conflict-diff', text: '不再可达' }),
+      document.createTextNode('——两人间的全部通路都经过被删成员。'),
+    ]));
+  }
+  const paths = el('div', { class: 'paths' });
+  paths.appendChild(renderDeletionSide('删除前（当前家谱）最短成员链', item.before));
+  paths.appendChild(renderDeletionSide('删除后（假设图）最短成员链', item.after));
+  block.appendChild(paths);
+  return block;
+}
+
+function renderDeletionGroup(title, items, kind) {
+  const group = el('div', { class: 'impact-group' });
+  group.appendChild(el('h3', { class: 'list-title', text: `${title}（${items.length} 对）` }));
+  for (const item of items) group.appendChild(renderDeletionItem(item, kind));
+  return group;
+}
+
+function renderMemberImpactResult(data) {
+  const box = $('member-impact-result');
+  box.replaceChildren();
+  box.dataset.hasResult = '1';
+
+  const affected = data.disconnectedCount + data.lengthenedCount;
+  const summary = el('div', { class: 'summary' });
+  summary.appendChild(el('div', {}, [
+    document.createTextNode('假设删除成员「'),
+    el('strong', { text: data.memberName }),
+    document.createTextNode(
+      `」：将一并移除 ${data.removedEdgeCount} 条相连亲子关系，删除后家谱剩 ` +
+      `${data.remainingMemberCount} 名成员。基于家谱版本 ${data.version} 的只读假设图试算，未写入家谱。`,
+    ),
+  ]));
+  summary.appendChild(el('div', {}, [
+    document.createTextNode('共比较删除前原本可达、删除后两端仍在谱的有序祖先→后代成员对 '),
+    el('strong', { text: `${data.comparedCount} 对` }),
+    document.createTextNode('：'),
+    el('strong', { class: 'conflict-diff', text: `删除后不可达 ${data.disconnectedCount} 对` }),
+    document.createTextNode('，'),
+    el('strong', { text: `最短代数增加 ${data.lengthenedCount} 对` }),
+    document.createTextNode(`，不受影响 ${data.unaffectedCount} 对。`),
+  ]));
+  box.appendChild(summary);
+
+  if (affected === 0) {
+    box.appendChild(el('p', {
+      class: 'empty-hint',
+      text:
+        '删除该成员不会使任何仍在谱的祖先→后代成员对断联或绕远：' +
+        '仍可达的成员对都保留同代通路（多路径情形不会误报为断联）。',
+    }));
+    return;
+  }
+
+  if (data.disconnected.length > 0) {
+    box.appendChild(renderDeletionGroup('删除后不可达的成员对（断联）', data.disconnected, 'disconnected'));
+  }
+  if (data.lengthened.length > 0) {
+    box.appendChild(renderDeletionGroup('仍可达但最短代数增加的成员对（绕远）', data.lengthened, 'lengthened'));
+  }
 }
 
 /* ---------------- 后代支系视图 ---------------- */

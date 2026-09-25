@@ -186,6 +186,17 @@ button.danger-link {
   font-size: 0.85rem;
 }
 
+/* 中性的行内文字按钮（如「删除影响」预览入口，区别于真正的删除） */
+button.link-action {
+  border: none;
+  background: none;
+  color: var(--primary);
+  padding: 2px 6px;
+  font-size: 0.85rem;
+}
+
+button.link-action:hover { text-decoration: underline; background: none; }
+
 .member-list, .edge-list {
   list-style: none;
   margin: 0;

@@ -858,6 +858,120 @@ function previewEdgeImpact(state, change) {
 }
 
 /**
+ * 删除成员影响预览（纯函数，不修改 state、不写入任何数据）。
+ *
+ * 以当前家谱为基准，构造一个不落盘的只读假设图：移除目标成员本身，以及全部
+ * 以其为父母或子女的亲子关系（与真实 deleteMember 的级联范围一致），其余成员保留。
+ *
+ * 比较范围限定为删除后**仍在谱中**的、有序的「祖先 → 后代」成员对（两人不同）：
+ * 以变更前（当前家谱）原本可达为准逐对枚举，在两张图上分别求祖先到后代的
+ * **最短代数（BFS 首达步数）与一条最短成员链**，按最短代数判定：
+ *   - disconnected：变更前可达、删除后不可达（唯一通路经过被删成员）；
+ *     after 为 null（删除后成员链为空）；
+ *   - lengthened：删除后仍可达但最短代数变大（最短链经过被删成员，
+ *     只能改走更长的替代路径），附 genIncrease（增加的代数）；
+ *   - 其余（最短代数不变，含仍有**同代替代路径**的多路径情形）计入 unaffectedCount，
+ *     不逐条列出——因此不能把仍有替代路径的成员对误报为断联。
+ * 删边与删点只会消除路径，不会产生新路径或更短路径，故不存在「删除后变短 / 新可达」。
+ * 端点之一是被删成员的成员对随其离谱，不参与比较。
+ *
+ * 返回 { error } 或 {
+ *   memberId, removedEdgeCount, remainingMemberCount,
+ *   comparedCount,       // 变更前原本可达、且两端删除后仍在谱的成员对总数
+ *   disconnectedCount, lengthenedCount, unaffectedCount,
+ *   disconnected: [{ ancestorId, descendantId, before: { minGen, shortestPath }, after: null }],
+ *   lengthened:   [{ ancestorId, descendantId, genIncrease,
+ *                    before: { minGen, shortestPath }, after: { minGen, shortestPath } }],
+ * }  // shortestPath 方向为 [祖先, ..., 后代]；before 的链允许经过被删成员（删除前其仍在谱）
+ */
+function previewMemberDeletion(state, rawMemberId) {
+  const memberId = typeof rawMemberId === 'string' ? rawMemberId.trim() : '';
+  if (!memberId || !hasMember(state, memberId)) return { error: '成员不存在' };
+
+  // 构造删除后的只读假设图（深拷贝父母邻接表），当前家谱保持不变
+  const remainingMembers = state.members.filter((m) => m.id !== memberId);
+  const parentsOf = {};
+  let removedEdgeCount = 0;
+  for (const [childId, parents] of Object.entries(state.parentsOf || {})) {
+    if (childId === memberId) {
+      removedEdgeCount += parents.length; // 以被删成员为子女的关系
+      continue;
+    }
+    const kept = parents.filter((p) => p !== memberId);
+    removedEdgeCount += parents.length - kept.length; // 以被删成员为父母的关系
+    parentsOf[childId] = kept;
+  }
+  const hypoState = { ...state, members: remainingMembers, parentsOf };
+
+  // 按后代缓存两张图的祖先档案，避免重复 BFS
+  const beforeCache = new Map();
+  const afterCache = new Map();
+  const profilesOf = (cache, targetState, descendantId) => {
+    if (!cache.has(descendantId)) cache.set(descendantId, ancestorProfiles(targetState, descendantId));
+    return cache.get(descendantId);
+  };
+
+  const pickShortest = (p) => ({ minGen: p.minGen, shortestPath: p.shortestPath });
+
+  const disconnected = [];
+  const lengthened = [];
+  let unaffectedCount = 0;
+  let comparedCount = 0;
+
+  // 仅枚举删除后仍在谱中的成员对；以变更前（当前家谱）原本可达为准
+  for (const descendant of remainingMembers) {
+    const beforeMap = profilesOf(beforeCache, state, descendant.id);
+    const afterMap = profilesOf(afterCache, hypoState, descendant.id);
+    for (const [ancestorId, beforeProfile] of beforeMap) {
+      if (ancestorId === memberId) continue; // 祖先随删除离谱，不参与比较
+      comparedCount += 1;
+      const afterProfile = afterMap.get(ancestorId) || null;
+      if (!afterProfile) {
+        disconnected.push({
+          ancestorId,
+          descendantId: descendant.id,
+          before: pickShortest(beforeProfile),
+          after: null,
+        });
+      } else if (afterProfile.minGen > beforeProfile.minGen) {
+        lengthened.push({
+          ancestorId,
+          descendantId: descendant.id,
+          genIncrease: afterProfile.minGen - beforeProfile.minGen,
+          before: pickShortest(beforeProfile),
+          after: pickShortest(afterProfile),
+        });
+      } else {
+        unaffectedCount += 1;
+      }
+    }
+  }
+
+  // 排序：影响严重者优先，同档按成员 ID 保证确定性
+  const byIds = (x, y) => {
+    if (x.ancestorId !== y.ancestorId) return x.ancestorId.localeCompare(y.ancestorId);
+    return x.descendantId.localeCompare(y.descendantId);
+  };
+  disconnected.sort((x, y) => y.before.minGen - x.before.minGen || byIds(x, y));
+  lengthened.sort(
+    (x, y) =>
+      y.genIncrease - x.genIncrease || y.before.minGen - x.before.minGen || byIds(x, y),
+  );
+
+  return {
+    memberId,
+    removedEdgeCount,
+    remainingMemberCount: remainingMembers.length,
+    comparedCount,
+    disconnectedCount: disconnected.length,
+    lengthenedCount: lengthened.length,
+    unaffectedCount,
+    disconnected,
+    lengthened,
+  };
+}
+
+/**
  * 备份文件整份校验（纯函数，不修改任何状态）。
  *
  * 备份格式（与下载接口一致，仅含成员 ID、姓名、纪念日与关系）：
@@ -1076,4 +1190,5 @@ module.exports = {
   ancestorProfiles,
   findGenerationConflicts,
   previewEdgeImpact,
+  previewMemberDeletion,
 };
