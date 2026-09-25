@@ -858,6 +858,164 @@ function previewEdgeImpact(state, change) {
 }
 
 /**
+ * 沿「父母 → 子女」方向的最短路全表（纯函数，不修改 state）。
+ *
+ * 以每位成员为祖先做一次向下 BFS，返回 ancestorId -> Map(descendantId -> {
+ *   gen,            // 最短代数（向下步数）：子女 1、孙辈 2……
+ *   prev,           // BFS 首达前驱（其父母），用于重建一条祖先 → … → 后代的最短链
+ * })，祖先本人以 gen 0 记录在表中；不可达的成员对不出现在表内。
+ *
+ * 判定只看最短代数：同一后代经多条路径到达时，BFS 首达步数即最短代数，
+ * 是否仍有替代路径、替代路径长短都不会影响可达性结论。
+ * 每个父母的子女按 ID 排序后入队，保证首达前驱确定、重建出的最短链稳定。
+ */
+function shortestPathsDown(state) {
+  const childrenOf = {};
+  for (const [childId, parents] of Object.entries(state.parentsOf || {})) {
+    for (const parentId of parents) (childrenOf[parentId] ||= []).push(childId);
+  }
+  for (const id of Object.keys(childrenOf)) {
+    childrenOf[id].sort((a, b) => a.localeCompare(b));
+  }
+
+  const byAncestor = new Map();
+  for (const ancestor of state.members) {
+    const dist = new Map([[ancestor.id, { gen: 0, prev: null }]]);
+    const queue = [ancestor.id];
+    for (let head = 0; head < queue.length; head++) {
+      const cur = queue[head];
+      for (const childId of childrenOf[cur] || []) {
+        if (!dist.has(childId)) {
+          dist.set(childId, { gen: dist.get(cur).gen + 1, prev: cur });
+          queue.push(childId);
+        }
+      }
+    }
+    byAncestor.set(ancestor.id, dist);
+  }
+  return byAncestor;
+}
+
+/** 沿 BFS 前驱表重建 祖先 → 子女 → … → 后代 的一条最短成员链 */
+function rebuildDownPath(dist, ancestorId, descendantId) {
+  const path = [descendantId];
+  let cur = descendantId;
+  while (cur !== ancestorId) {
+    cur = dist.get(cur).prev;
+    path.push(cur);
+  }
+  path.reverse();
+  return path;
+}
+
+/**
+ * 删除成员影响预览（纯函数，不修改 state、不写入任何数据）。
+ *
+ * 以当前家谱为基准构造不落盘的只读假设图：移除 memberId 本人，并移除
+ * 全部以其为父母或子女的相连亲子关系（与真实删除成员的级联规则一致），
+ * 其余成员（仍在谱中的成员）与关系保持不变。
+ *
+ * 仅比较**两端都仍在谱中**的有序 祖先 → 后代 成员对（删除前在当前图上
+ * 可达才纳入），按**最短代数**（向下 BFS 首达步数）逐对判定：
+ *   - disconnected：删除前可达、删除后不可达（唯一通路随该成员被移除）；
+ *   - lengthened：删除后仍可达，但最短代数变大（短链经过被删成员，
+ *     改走更长的替代路径）；
+ *   - 最短代数不变（含改走另一条同代替代路径的情况）计入 unchangedCount，
+ *     不逐条列出——仍有替代路径的成员对绝不会被误报为断联。
+ * 每条给出变更前 / 变更后各一条最短成员链（祖先 → … → 后代，链长减一即代数）；
+ * 删除后不可达时 after 为 null（成员链为空）。变更前的最短链允许经过被删成员，
+ * 以直观展示该链路为何受影响。
+ *
+ * 成员不存在时返回 { error: '成员不存在' }。
+ *
+ * 返回 {
+ *   memberId, remainingMemberCount, removedEdgeCount, unchangedCount,
+ *   disconnected: [{ ancestorId, descendantId, before: { gen, path }, after: null }],
+ *   lengthened:   [{ ancestorId, descendantId, before: { gen, path }, after: { gen, path } }],
+ * }
+ */
+function previewMemberDeletion(state, memberId) {
+  if (!hasMember(state, memberId)) return { error: '成员不存在' };
+
+  // 假设图：删除成员本人，并级联移除其全部相连亲子关系
+  const remainingMembers = state.members.filter((m) => m.id !== memberId);
+  const remainingIds = new Set(remainingMembers.map((m) => m.id));
+  const parentsOf = {};
+  let removedEdgeCount = 0;
+  for (const [childId, parents] of Object.entries(state.parentsOf || {})) {
+    if (childId === memberId) {
+      removedEdgeCount += parents.length; // 被删成员作为子女
+      continue;
+    }
+    const kept = parents.filter((p) => p !== memberId);
+    removedEdgeCount += parents.length - kept.length; // 被删成员作为父母
+    parentsOf[childId] = kept;
+  }
+  const hypoState = { ...state, members: remainingMembers, parentsOf };
+
+  const beforeAll = shortestPathsDown(state);
+  const afterAll = shortestPathsDown(hypoState);
+
+  const disconnected = [];
+  const lengthened = [];
+  let unchangedCount = 0;
+
+  const orderedIds = [...remainingIds].sort((a, b) => a.localeCompare(b));
+  for (const ancestorId of orderedIds) {
+    const beforeDist = beforeAll.get(ancestorId);
+    const afterDist = afterAll.get(ancestorId);
+    for (const descendantId of orderedIds) {
+      if (ancestorId === descendantId) continue;
+      const before = beforeDist.get(descendantId);
+      if (!before) continue; // 只比较删除前仍可达的成员对
+      const beforeInfo = {
+        gen: before.gen,
+        path: rebuildDownPath(beforeDist, ancestorId, descendantId),
+      };
+      const after = afterDist.get(descendantId);
+      if (!after) {
+        disconnected.push({ ancestorId, descendantId, before: beforeInfo, after: null });
+      } else if (after.gen > before.gen) {
+        lengthened.push({
+          ancestorId,
+          descendantId,
+          before: beforeInfo,
+          after: {
+            gen: after.gen,
+            path: rebuildDownPath(afterDist, ancestorId, descendantId),
+          },
+        });
+      } else {
+        // 删除边只会让最短路不变或变长；同代替代路径存在时同样落在这里
+        unchangedCount += 1;
+      }
+    }
+  }
+
+  const byIds = (x, y) => {
+    if (x.ancestorId !== y.ancestorId) return x.ancestorId.localeCompare(y.ancestorId);
+    return x.descendantId.localeCompare(y.descendantId);
+  };
+  disconnected.sort((x, y) => y.before.gen - x.before.gen || byIds(x, y));
+  const increaseOf = (item) => item.after.gen - item.before.gen;
+  lengthened.sort(
+    (x, y) =>
+      increaseOf(y) - increaseOf(x) ||
+      y.after.gen - x.after.gen ||
+      byIds(x, y),
+  );
+
+  return {
+    memberId,
+    remainingMemberCount: remainingMembers.length,
+    removedEdgeCount,
+    unchangedCount,
+    disconnected,
+    lengthened,
+  };
+}
+
+/**
  * 备份文件整份校验（纯函数，不修改任何状态）。
  *
  * 备份格式（与下载接口一致，仅含成员 ID、姓名、纪念日与关系）：
@@ -1076,4 +1234,5 @@ module.exports = {
   ancestorProfiles,
   findGenerationConflicts,
   previewEdgeImpact,
+  previewMemberDeletion,
 };

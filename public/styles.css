@@ -315,6 +315,20 @@ button.danger-link {
 
 .impact-group .list-title { margin: 0 0 10px; }
 
+/* 删除成员影响预览 */
+.deletion-group { margin-top: 14px; }
+
+.deletion-broken {
+  color: #991b1b;
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  border-radius: 6px;
+  padding: 6px 9px;
+  font-size: 0.85rem;
+}
+
+.member-list .deletion-preview-link { white-space: nowrap; }
+
 /* Toast */
 .toast {
   position: fixed;

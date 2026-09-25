@@ -8,6 +8,7 @@ const {
   findGenerationConflicts,
   validateEdge,
   previewEdgeImpact,
+  previewMemberDeletion,
   descendantBranches,
   MAX_DESCENDANT_GENERATIONS,
 } = require('./familyGraph');
@@ -66,6 +67,52 @@ app.delete('/api/members/:id', (req, res) => {
   const result = store.deleteMember(req.params.id);
   if (result.error) return sendError(res, 404, result.error);
   res.json(store.list());
+});
+
+/**
+ * 删除成员影响预览（只读，不写入任何数据、不改变版本、不产生撤销快照）：
+ * 服务端基于当前家谱构造不落盘的只读假设图，移除所选成员及其全部相连的
+ * 父母→子女关系，仅比较仍在谱中的有序 祖先→后代 成员对——列出删除前
+ * 可达而删除后不可达的成员对（断联），以及仍可达但最短代数增加的成员对，
+ * 每条给出变更前、变更后各一条最短成员链（不可达时变更后为空）。
+ * 可达性按最短代数（BFS）判定：仍有替代路径（含同代替代路径）的成员对
+ * 不会被误报为断联。响应携带当前家谱版本 version：页面据此标注
+ * 「基于版本 N」，家谱发生写入后提示重新预览。
+ * 请求体：{ "memberId": "..." }；缺少 memberId 返回 400，成员不存在返回 404。
+ */
+app.post('/api/members/deletion-impact/preview', (req, res) => {
+  const memberId = requireId(req.body, 'memberId');
+  if (!memberId) return sendError(res, 400, '请选择要预览删除的成员');
+
+  const result = previewMemberDeletion(store.getState(), memberId);
+  if (result.error) return sendError(res, 404, result.error);
+
+  const byId = new Map(store.list().members.map((m) => [m.id, m.name]));
+  const nameOf = (id) => byId.get(id) || '（已删除）';
+  const decorateSide = (side) =>
+    side && {
+      gen: side.gen,
+      path: side.path.map((id) => ({ id, name: nameOf(id) })),
+    };
+  const decorateItem = (item) => ({
+    ancestorId: item.ancestorId,
+    ancestorName: nameOf(item.ancestorId),
+    descendantId: item.descendantId,
+    descendantName: nameOf(item.descendantId),
+    before: decorateSide(item.before),
+    after: decorateSide(item.after), // 不可达时为 null，成员链为空
+  });
+
+  res.json({
+    version: store.getVersion(),
+    memberId: result.memberId,
+    memberName: nameOf(result.memberId),
+    remainingMemberCount: result.remainingMemberCount,
+    removedEdgeCount: result.removedEdgeCount,
+    unchangedCount: result.unchangedCount,
+    disconnected: result.disconnected.map(decorateItem),
+    lengthened: result.lengthened.map(decorateItem),
+  });
 });
 
 /**
